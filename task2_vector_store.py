@@ -1,153 +1,195 @@
-# Import necessary libraries
+# Import required libraries
+from sentence_transformers import SentenceTransformer
+import faiss
+from transformers import pipeline
+from langchain_community.llms import HuggingFacePipeline
 import pandas as pd
 import numpy as np
-from sentence_transformers import SentenceTransformer
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-import faiss
+from typing import List, Dict, Tuple
 import os
-import time
 import json
-from tqdm import tqdm
 
-# Configuration
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-CHUNK_SIZE = 512  # Number of characters per chunk
-CHUNK_OVERLAP = 50  # Number of characters overlap between chunks
-VECTOR_STORE_DIR = "vector_store"
-METADATA_FILE = "metadata.json"
-INDEX_FILE = "faiss_index.index"
-
-# Create output directory
-os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
-
-class VectorStoreCreator:
-    def __init__(self, model_name=EMBEDDING_MODEL_NAME):
-        self.model = SentenceTransformer(model_name)
-        self.dimension = self.model.get_sentence_embedding_dimension()
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-            length_function=len,
-            separators=["\n\n", "\n", ".", " ", ""]
-        )
-        self.metadata = []
-        self.index = None
-
-    def chunk_text(self, text, metadata_base):
-        """Split text into chunks and prepare metadata for each chunk"""
-        chunks = self.text_splitter.split_text(text)
-        
-        chunk_metadata = []
-        for i, chunk in enumerate(chunks):
-            chunk_metadata.append({
-                **metadata_base,
-                "chunk_id": i,
-                "chunk_size": len(chunk),
-                "num_chunks": len(chunks)
-            })
-        
-        return chunks, chunk_metadata
-
-    def create_vector_store(self, input_file):
-        """Main method to create the vector store from cleaned data"""
-        print("Loading cleaned data...")
-        df = pd.read_csv(input_file)
-        print(f"Processing {len(df)} complaints...")
-        
-        # Initialize FAISS index
-        self.index = faiss.IndexFlatIP(self.dimension)
-        
-        # Process each complaint
-        all_chunks = []
-        for _, row in tqdm(df.iterrows(), total=len(df)):
-            # Prepare base metadata for this complaint
-            metadata_base = {
-                "complaint_id": row.get('Complaint ID', str(_)),
-                "product": row['Product'],
-                "original_text_length": len(row['cleaned_narrative'])
-            }
-            
-            # Split text into chunks
-            chunks, chunk_metadata = self.chunk_text(row['cleaned_narrative'], metadata_base)
-            all_chunks.extend(chunks)
-            self.metadata.extend(chunk_metadata)
-        
-        # Generate embeddings in batches to avoid memory issues
-        print("Generating embeddings...")
-        batch_size = 128
-        for i in tqdm(range(0, len(all_chunks), batch_size)):
-            batch = all_chunks[i:i + batch_size]
-            embeddings = self.model.encode(batch, show_progress_bar=False)
-            self.index.add(embeddings.astype('float32'))
-        
-        # Save the vector store and metadata
-        self.save_vector_store()
-
-    def save_vector_store(self):
-        """Save the FAISS index and metadata to disk"""
-        print("Saving vector store...")
-        
-        # Save FAISS index
-        faiss.write_index(self.index, os.path.join(VECTOR_STORE_DIR, INDEX_FILE))
-        
-        # Save metadata
-        with open(os.path.join(VECTOR_STORE_DIR, METADATA_FILE), 'w') as f:
-            json.dump(self.metadata, f)
-        
-        print(f"Vector store saved to {VECTOR_STORE_DIR}/")
-
-    def generate_report_section(self):
-        """Generate the report section for Task 2"""
-        report = f"""
-        ## Task 2: Text Chunking, Embedding, and Vector Store Indexing
-        
-        ### Chunking Strategy
-        - **Chunk Size**: {CHUNK_SIZE} characters
-        - **Chunk Overlap**: {CHUNK_OVERLAP} characters
-        - **Splitter Type**: RecursiveCharacterTextSplitter from LangChain
-        - **Separators**: ["\\n\\n", "\\n", ".", " ", ""]
-        
-        The chunk size of {CHUNK_SIZE} characters was chosen after experimentation to balance:
-        1. Keeping related context together in each chunk
-        2. Avoiding chunks that are too large for effective embedding
-        3. Maintaining enough context overlap ({CHUNK_OVERLAP} characters) to prevent important information from being split across chunk boundaries
-        
-        ### Embedding Model
-        - **Model Name**: {EMBEDDING_MODEL_NAME}
-        - **Dimensions**: {self.dimension}
-        
-        This model was chosen because:
-        1. It's optimized for semantic similarity tasks
-        2. Provides a good balance between accuracy and computational efficiency
-        3. Has been widely tested and proven effective for retrieval tasks
-        4. The smaller size (compared to larger models) allows for faster embedding generation while still maintaining good quality
-        
-        ### Vector Store
-        - **Technology**: FAISS (Facebook AI Similarity Search)
-        - **Index Type**: FlatIP (Inner Product) for exact similarity search
-        - **Total Vectors Stored**: {len(self.metadata) if self.metadata else 'Not calculated yet'}
-        
-        FAISS was chosen for its:
-        1. Efficient similarity search capabilities
-        2. Ability to handle large-scale vector databases
-        3. Support for exact and approximate nearest neighbor search
-        4. Easy persistence to disk for later reuse
+class RAGPipeline:
+    """
+    A Retrieval-Augmented Generation pipeline for analyzing financial complaints.
+    Uses the direct FAISS implementation to match Task 2's output format.
+    """
+    
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
         """
+        Initialize the RAG pipeline with embedding model and vector store.
+        """
+        # Load the embedding model (must match Task 2's model)
+        self.embedding_model = SentenceTransformer(model_name)
         
-        # Save report section
-        with open('reports/task2_report.md', 'w') as f:
-            f.write(report)
-        print("Task 2 report section saved to 'reports/task2_report.md'")
+        # Set the vector store paths
+        self.vector_store_dir = "vector_store"
+        self.index_file = os.path.join(self.vector_store_dir, "faiss_index.index")
+        self.metadata_file = os.path.join(self.vector_store_dir, "metadata.json")
+        
+        # Debugging output
+        print(f"\nCurrent working directory: {os.getcwd()}")
+        print(f"Looking for vector store files in: {os.path.abspath(self.vector_store_dir)}")
+        
+        # Verify files exist
+        if not os.path.exists(self.index_file):
+            raise FileNotFoundError(f"FAISS index file not found at {self.index_file}")
+        if not os.path.exists(self.metadata_file):
+            raise FileNotFoundError(f"Metadata file not found at {self.metadata_file}")
+        
+        print(f"Found vector store files: {os.listdir(self.vector_store_dir)}")
+        
+        try:
+            # Load the FAISS index directly (as created in Task 2)
+            self.index = faiss.read_index(self.index_file)
+            
+            # Load metadata
+            with open(self.metadata_file, 'r') as f:
+                self.metadata = json.load(f)
+                
+            print("Vector store loaded successfully!")
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load vector store. Please ensure:\n"
+                f"1. Files were generated with the same FAISS version\n"
+                f"2. The index file is not corrupted\n"
+                f"Original error: {str(e)}"
+            )
+        
+        # Initialize the LLM
+        self.llm = self._initialize_llm()
+        
+        # Define the prompt template
+        self.prompt_template = """
+        You are a financial analyst assistant for CreditTrust. Your task is to answer 
+        questions about customer complaints. Use the following retrieved complaint 
+        excerpts to formulate your answer. If the context doesn't contain the answer, 
+        state that you don't have enough information.
+        
+        Context: {context}
+        
+        Question: {question}
+        
+        Answer:
+        """
+    
+    def _initialize_llm(self):
+        """Initialize the Hugging Face language model pipeline."""
+        try:
+            hf_pipeline = pipeline(
+                "text-generation",
+                model="distilgpt2",
+                device="cpu",
+                max_new_tokens=150,
+                temperature=0.7
+            )
+            return HuggingFacePipeline(pipeline=hf_pipeline)
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize LLM: {str(e)}")
+    
+    def retrieve_relevant_chunks(self, question: str, k: int = 5) -> List[Dict]:
+        """Retrieve relevant text chunks based on the user's question."""
+        try:
+            # Encode the question
+            question_embedding = self.embedding_model.encode(question)
+            question_embedding = question_embedding.astype('float32').reshape(1, -1)
+            
+            # Search the index
+            distances, indices = self.index.search(question_embedding, k)
+            
+            # Get the corresponding metadata and chunks
+            results = []
+            for idx in indices[0]:
+                if idx < 0:  # FAISS returns -1 for invalid indices
+                    continue
+                metadata = self.metadata[idx]
+                results.append({
+                    "text": metadata.get('chunk_text', ''),  # Note: You'll need to store text in metadata in Task 2
+                    "product": metadata.get("product", "Unknown"),
+                    "complaint_id": metadata.get("complaint_id", "Unknown")
+                })
+            
+            return results
+        except Exception as e:
+            raise RuntimeError(f"Error during retrieval: {str(e)}")
+    
+    def generate_answer(self, question: str, retrieved_chunks: List[Dict]) -> str:
+        """Generate an answer using the retrieved context."""
+        try:
+            context = "\n\n".join(
+                f"Product: {chunk['product']}\nComplaint: {chunk['text']}" 
+                for chunk in retrieved_chunks
+            )
+            prompt = self.prompt_template.format(context=context, question=question)
+            return self.llm(prompt)
+        except Exception as e:
+            raise RuntimeError(f"Error during generation: {str(e)}")
+    
+    def run_pipeline(self, question: str, k: int = 5) -> Tuple[str, List[Dict]]:
+        """Run the complete RAG pipeline."""
+        try:
+            chunks = self.retrieve_relevant_chunks(question, k)
+            answer = self.generate_answer(question, chunks)
+            return answer, chunks
+        except Exception as e:
+            raise RuntimeError(f"RAG pipeline failed: {str(e)}")
+    
+    def evaluate_pipeline(self, test_questions: List[str]) -> pd.DataFrame:
+        """Evaluate the RAG pipeline on test questions."""
+        results = []
+        for question in test_questions:
+            try:
+                answer, chunks = self.run_pipeline(question)
+                sources = "\n\n".join(
+                    f"Product: {chunk['product']}\nText: {chunk['text'][:100]}..." 
+                    for chunk in chunks[:2]
+                )
+                results.append({
+                    "Question": question,
+                    "Generated Answer": answer,
+                    "Retrieved Sources": sources,
+                    "Quality Score": None,
+                    "Comments/Analysis": ""
+                })
+            except Exception as e:
+                print(f"Error processing question '{question}': {str(e)}")
+                continue
+        
+        # Save results
+        os.makedirs("reports", exist_ok=True)
+        report_path = os.path.join("reports", "rag_evaluation_report.md")
+        pd.DataFrame(results).to_markdown(report_path, index=False)
+        return pd.DataFrame(results)
 
 if __name__ == "__main__":
-    # Initialize vector store creator
-    creator = VectorStoreCreator()
-    
-    # Process the cleaned data
-    start_time = time.time()
-    creator.create_vector_store('filtered_data/filtered_complaints.csv')
-    
-    # Generate report section
-    creator.generate_report_section()
-    
-    print(f"Task 2 completed in {time.time() - start_time:.2f} seconds")
+    try:
+        print("Initializing RAG pipeline...")
+        rag = RAGPipeline()
+        
+        test_questions = [
+            "What are the most common complaints about Buy Now Pay Later services?",
+            "Why are customers unhappy with credit card billing?",
+            "What issues do customers report with money transfers?"
+        ]
+        
+        print("\nRunning evaluation...")
+        results = rag.evaluate_pipeline(test_questions)
+        
+        print("\nEvaluation complete. Sample results:")
+        print(results[["Question", "Generated Answer"]].head(1))
+        
+        print(f"\nFull report saved to: reports/rag_evaluation_report.md")
+        
+    except Exception as e:
+        print(f"\nError: {str(e)}")
+        print("\nTroubleshooting steps:")
+        print("1. Verify Task 2 stored both the text chunks and metadata correctly")
+        print("2. Check FAISS version consistency between tasks")
+        print("3. Ensure the metadata includes the actual chunk text")
+        
+        # Show directory structure for debugging
+        print("\nCurrent directory contents:")
+        print(os.listdir('.'))
+        if os.path.exists("vector_store"):
+            print("\nVector store contents:")
+            print(os.listdir("vector_store"))
