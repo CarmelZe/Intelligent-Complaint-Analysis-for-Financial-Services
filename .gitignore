@@ -141,6 +141,7 @@ celerybeat.pid
 env/
 data/
 filtered_data/
+vector_store/
 venv/
 ENV/
 env.bak/
